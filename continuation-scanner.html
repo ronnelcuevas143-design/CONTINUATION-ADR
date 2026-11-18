@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="fil"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Continuation + ADR Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#0b0f17;color:#e8edf5;font:16px/1.4 system-ui,sans-serif}
+h1{font-size:26px;margin:4px 0 14px}h2{font-size:20px;margin:22px 0 10px}
+.panel{background:#10151f;border:1px solid #2a3243;border-radius:14px;padding:14px}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+label{display:block;color:#9aa5b8;font-size:14px;margin-bottom:5px}
+input,select{width:100%;background:#0b0f17;color:#fff;border:1px solid #2a3243;border-radius:10px;padding:13px;font-size:17px}
+.ck{display:flex;align-items:center;gap:10px;color:#e8edf5;font-size:17px;margin:0 0 12px}
+.ck input{width:24px;height:24px;flex:none;accent-color:#5aa9ff}
+button{width:100%;background:#5aa9ff;color:#0b0f17;border:0;border-radius:10px;padding:15px;font-size:20px;font-weight:700}
+button:disabled{opacity:.55}
+button.s{width:auto;font-size:14px;padding:7px 12px;background:#1b2332;color:#9aa5b8;font-weight:500}
+#status{color:#9aa5b8;margin:12px 2px}
+.card{background:#10151f;border:1px solid #2a3243;border-left:6px solid;border-radius:12px;padding:14px;margin-bottom:12px}
+.card.long{border-left-color:#22c55e}.card.short{border-left-color:#ef4444}
+.top{display:flex;justify-content:space-between;gap:8px;align-items:baseline;flex-wrap:wrap}
+.top a{color:#e8edf5;font-size:20px;font-weight:700}
+.tag.long{color:#22c55e}.tag.short{color:#ef4444}.tag{font-weight:700;font-size:18px}
+.k{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:10px 0}
+.k small{display:block;color:#9aa5b8;font-size:13px}.k b{font-size:17px}
+.m{color:#9aa5b8;font-size:14px;margin-top:4px}.m.b{color:#5aa9ff}
+table{width:100%;border-collapse:collapse;font-size:15px}
+td,th{padding:7px 4px;text-align:right;border-bottom:1px solid #1b2332}td:first-child,th:first-child{text-align:left}
+th{color:#9aa5b8;font-weight:500}.w{color:#22c55e}.l{color:#ef4444}
+</style></head><body>
+<h1>Continuation + ADR Scanner</h1>
+<div class="panel">
+<div class="g">
+<div><label>Data source</label><select id="src"><option value="fut">Binance Futures</option><option value="spot">Binance Spot</option></select></div>
+<div><label>HTF → LTF</label><select id="pair"><option value="ALL">ALL (1D→1H + 4H→15m)</option><option value="1D→1H">1D → 1H</option><option value="4H→15m">4H → 15m</option></select></div>
+<div><label>Top coins (by volume)</label><input id="top" type="number" value="100"></div>
+<div><label>Lookback (signal sa huling n closed LTF candles)</label><input id="fresh" type="number" value="3"></div>
+<div><label>ADR period (daily candles)</label><input id="adrN" type="number" value="10"></div>
+<div><label>Min RR</label><input id="rr" type="number" step="0.5" value="2"></div>
+</div>
+<div class="ck"><input type="checkbox" id="adrOn" checked><span>ADR filter (TP dapat abot pa sa ADR ng araw)</span></div>
+<div class="ck"><input type="checkbox" id="pdOn"><span>PDH / PDL open target (hindi pa na-take out)</span></div>
+<div class="ck"><input type="checkbox" id="strict" checked><span>Strict: HTF close lampas sa previous candle high/low</span></div>
+<label>Discord webhook (optional)</label>
+<input id="hook" placeholder="https://discord.com/api/webhooks/..." style="margin-bottom:12px">
+<div class="ck"><input type="checkbox" id="auto"><span>Auto-scan every 5 min</span></div>
+<button id="go">SCAN</button>
+</div>
+<div id="status"></div>
+<h2>Active setups (saved)</h2><div id="active"></div>
+<h2>History</h2><div id="stats"></div><div id="hist"></div>
+<div style="margin:12px 0"><button class="s" id="clr">Clear history</button></div>
+<script>
+const $=id=>document.getElementById(id);
+const LS={get(k,d){try{const v=localStorage.getItem(k);return v?JSON.parse(v):d}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+const PAIRS={'1D→1H':{htf:'1d',ltf:'1h',lim:30},'4H→15m':{htf:'4h',ltf:'15m',lim:24}};
+const IDS=['src','pair','top','fresh','adrN','rr','hook'],CKS=['adrOn','pdOn','strict','auto'];
+let active=LS.get('ca',[]),hist=LS.get('ch',[]),timer=null,busy=false,lastErr='';
+const base=()=>$('src').value==='fut'?'https://fapi.binance.com/fapi/v1':'https://api.binance.com/api/v3';
+const parse=k=>({t:k[0],o:+k[1],h:+k[2],l:+k[3],c:+k[4],ct:k[6]});
+async function jget(u){const r=await fetch(u);if(!r.ok)throw new Error('HTTP '+r.status);return r.json()}
+const kl=(s,i,n,st)=>jget(`${base()}/klines?symbol=${s}&interval=${i}&limit=${n}`+(st?`&startTime=${st}`:'')).then(a=>a.map(parse));
+async function pool(items,n,fn){let i=0;await Promise.all(Array.from({length:n},async()=>{while(i<items.length)await fn(items[i++])}))}
+const fmt=p=>{const a=Math.abs(p);return (+p.toFixed(a>=100?2:a>=1?4:a>=.01?5:8)).toString()};
+const tm=t=>new Date(t).toLocaleString('en-PH',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'});
+const inv=c=>({t:c.t,ct:c.ct,o:-c.o,h:-c.l,l:-c.h,c:-c.c});
+const save=()=>{LS.set('ca',active);LS.set('ch',hist)};
+const setStatus=t=>$('status').textContent=t;
+
+function getCfg(){const n=(id,d,m)=>Math.max(m,+$(id).value||d);
+ return{src:$('src').value,pair:$('pair').value,top:n('top',100,1),fresh:n('fresh',3,1),adrN:n('adrN',10,2),rr:n('rr',2,.5),adrOn:$('adrOn').checked,pdOn:$('pdOn').checked,strict:$('strict').checked}}
+
+// Long logic. Short = same logic on inverted candles.
+function seek(Lc,li,fresh,rr){
+ const n=Lc.length;
+ for(let e=n-1;e>=Math.max(li+2,n-fresh);e--){
+  let s=li;for(let i=li;i<=e;i++)if(Lc[i].l<Lc[s].l)s=i;      // protected swing = lowest low sa current HTF candle
+  if(s>e-2)continue;
+  let j=s;while(j>0&&!(Lc[j].c<Lc[j].o))j--;                    // last red candle
+  while(j>0&&Lc[j-1].c<Lc[j-1].o)j--;                           // simula ng down-leg
+  const lv=j>0?Lc[j-1].o:Lc[j].o;                               // CISD level = open ng last green bago ang down-leg
+  let k=-1;for(let i=s+1;i<e;i++)if(Lc[i].c>lv){k=i;break}      // CISD close
+  if(k<0||!(Lc[e].c>Lc[e].o))continue;                          // resumption candle (green)
+  let hh=-Infinity;for(let i=s;i<=e;i++)hh=Math.max(hh,Lc[i].h);
+  const sl=Lc[s].l,en=Lc[e].c,risk=en-sl;
+  if(risk<=0||en>(hh+sl)/2)continue;                            // entry dapat nasa discount (sakop ang EQ)
+  return{sl,en,tp:en+rr*risk,lv,k,e};
+ }
+ return null}
+
+function analyze(sym,name,d,cfg){
+ const p=PAIRS[name],now=Date.now(),out=[];
+ const H=d[p.htf],cur=H[H.length-1];
+ if(!cur||cur.ct<now)return out;
+ const hc=H.filter(c=>c.ct<now);if(hc.length<2)return out;
+ const b=hc[hc.length-1],pv=hc[hc.length-2],dirs=[];
+ if(cfg.strict){if(b.c>pv.h)dirs.push('long');if(b.c<pv.l)dirs.push('short')}
+ else dirs.push(b.c>b.o?'long':'short');
+ const Lc=d[p.ltf].filter(c=>c.ct<now),li=Lc.findIndex(c=>c.t>=cur.t);
+ if(li<0)return out;
+ const D=d['1d'],dc=D.filter(c=>c.ct<now),td=D[D.length-1];
+ if(!dc.length||td.ct<now)return out;
+ const w=dc.slice(-cfg.adrN),adr=w.reduce((a,c)=>a+c.h-c.l,0)/w.length,pd=dc[dc.length-1];
+ for(const dir of dirs){
+  const L=dir==='long'?Lc:Lc.map(inv),r=seek(L,li,cfg.fresh,cfg.rr);if(!r)continue;
+  const g=dir==='long'?1:-1,en=g*r.en,sl=g*r.sl,tp=g*r.tp;
+  const cap=dir==='long'?td.l+adr:td.h-adr;
+  if(cfg.adrOn&&(dir==='long'?tp>cap:tp<cap))continue;
+  if(cfg.pdOn){const t=dir==='long'?pd.h:pd.l;if(!(dir==='long'?(t>en&&td.h<t):(t<en&&td.l>t)))continue}
+  out.push({id:[sym,name,dir,cur.t].join('|'),sym,tf:name,dir,en,sl,tp,rr:cfg.rr,adr,used:(td.h-td.l)/adr*100,lv:g*r.lv,
+   tCISD:Lc[r.k].t,tSig:Lc[r.e].ct,t0:Lc[r.e].ct+1,htfOpen:cur.t,fut:cfg.src==='fut',strict:cfg.strict})}
+ return out}
+
+function add(a){
+ if(active.some(x=>x.id===a.id)||hist.some(x=>x.id===a.id))return false;
+ active.unshift(a);
+ const u=$('hook').value.trim();
+ if(u)fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:
+  `${a.dir==='long'?'🟢 LONG':'🔴 SHORT'} **${a.sym}** ${a.tf} (Continuation)\nEntry ${fmt(a.en)} · SL ${fmt(a.sl)} · TP ${fmt(a.tp)} · RR ${a.rr}\nADR ${fmt(a.adr)} (used ${a.used.toFixed(0)}%)`})}).catch(()=>{});
+ return true}
+
+async function track(){
+ for(const a of [...active]){
+  try{
+   const c=(await kl(a.sym,PAIRS[a.tf].ltf,200,a.t0)).filter(x=>x.ct<Date.now());let res=null;
+   for(const x of c){
+    const s=a.dir==='long'?x.l<=a.sl:x.h>=a.sl,t=a.dir==='long'?x.h>=a.tp:x.l<=a.tp;
+    if(s){res='loss';break}if(t){res='win';break}}      // SL at TP sa iisang candle = loss (conservative)
+   if(res){active=active.filter(z=>z.id!==a.id);hist.unshift({...a,res,r:res==='win'?a.rr:-1,closed:Date.now()})}
+  }catch(e){}}
+ hist=hist.slice(0,500);save()}
+
+async function scan(){
+ if(busy)return;busy=true;$('go').disabled=true;
+ try{
+  const cfg=getCfg(),names=cfg.pair==='ALL'?Object.keys(PAIRS):[cfg.pair];
+  setStatus('Tine-track ang active setups...');await track();render();
+  setStatus('Kinukuha ang top coins...');
+  const tk=await jget(base()+'/ticker/24hr');
+  const syms=tk.filter(x=>x.symbol.endsWith('USDT')).sort((a,b)=>b.quoteVolume-a.quoteVolume).slice(0,cfg.top).map(x=>x.symbol);
+  let done=0,nw=0,err=0;lastErr='';
+  await pool(syms,6,async s=>{
+   try{
+    const d={},need={'1d':cfg.adrN+3};
+    names.forEach(n=>{const p=PAIRS[n];if(p.htf!=='1d')need[p.htf]=4;need[p.ltf]=p.lim});
+    await Promise.all(Object.entries(need).map(async([i,n])=>d[i]=await kl(s,i,n)));
+    for(const n of names)for(const a of analyze(s,n,d,cfg))if(add(a))nw++;
+   }catch(e){err++;lastErr=e.message}
+   setStatus(`Nag-scan: ${++done}/${syms.length}`)});
+  save();render();
+  setStatus(`Done: ${syms.length} coins · ${nw} new · ${active.length} active · ${new Date().toLocaleTimeString()}`+(err?` · ${err} error (${lastErr}${/451|403/.test(lastErr)?' — baka naka-block ang Binance sa network mo':''})`:''));
+ }catch(e){setStatus('Error: '+e.message+(/451|403/.test(e.message)?' — baka naka-block ang Binance sa network mo':''))}
+ busy=false;$('go').disabled=false}
+
+function card(a,h){
+ const L=a.dir==='long',url=`https://www.tradingview.com/chart/?symbol=BINANCE:${a.sym}${a.fut?'.P':''}`;
+ return `<div class="card ${a.dir}"><div class="top"><a href="${url}" target="_blank" rel="noopener">${a.sym} 📈 ${a.tf}</a>
+  <span class="tag ${a.dir}">${L?'🟢 LONG (Bull continuation)':'🔴 SHORT (Bear continuation)'}</span></div>
+  <div class="k"><div><small>Entry (close ng signal)</small><b>${fmt(a.en)}</b></div><div><small>SL (protected swing)</small><b>${fmt(a.sl)}</b></div><div><small>TP</small><b>${fmt(a.tp)}</b></div><div><small>RR</small><b>${a.rr}</b></div></div>
+  <div class="m">ADR ${fmt(a.adr)} · nagamit na ${a.used.toFixed(0)}% ngayong araw · CISD level ${fmt(a.lv)}</div>
+  <div class="m b">HTF closure ✔ ${a.strict?'(lampas prev '+(L?'high':'low')+')':''}</div>
+  <div class="m">CISD: ${tm(a.tCISD)} · Signal candle close: ${tm(a.tSig)} · HTF candle bukas ${tm(a.htfOpen)}</div>
+  ${h?`<div class="m ${a.res==='win'?'w':'l'}"><b>${a.res==='win'?'WIN +'+a.rr+'R':'LOSS -1R'}</b> · ${tm(a.closed)}</div>`:`<div style="margin-top:8px"><button class="s" onclick="del('${a.id}')">Remove</button></div>`}</div>`}
+function del(id){active=active.filter(x=>x.id!==id);save();render()}
+
+function stat(arr){const w=arr.filter(x=>x.res==='win').length,n=arr.length,r=arr.reduce((s,x)=>s+x.r,0);
+ return{n,w,l:n-w,wr:n?(w/n*100).toFixed(0)+'%':'-',r:(r>0?'+':'')+r.toFixed(1)+'R'}}
+function render(){
+ $('active').innerHTML=active.length?active.map(a=>card(a,false)).join(''):'<div class="m">Wala pang active setup. Pindutin ang SCAN.</div>';
+ const rows=[['Lahat',hist],['Long',hist.filter(x=>x.dir==='long')],['Short',hist.filter(x=>x.dir==='short')],...Object.keys(PAIRS).map(k=>[k,hist.filter(x=>x.tf===k)])];
+ $('stats').innerHTML=`<table><tr><th></th><th>Trades</th><th>W</th><th>L</th><th>Win rate</th><th>Net</th></tr>`+
+  rows.map(([n,a])=>{const s=stat(a);return `<tr><td>${n}</td><td>${s.n}</td><td class="w">${s.w}</td><td class="l">${s.l}</td><td>${s.wr}</td><td>${s.r}</td></tr>`}).join('')+'</table>';
+ $('hist').innerHTML=hist.slice(0,30).map(a=>card(a,true)).join('')}
+
+function setAuto(){clearInterval(timer);timer=null;if($('auto').checked){timer=setInterval(scan,300000)}}
+const saveCfg=()=>{const o={};IDS.forEach(i=>o[i]=$(i).value);CKS.forEach(i=>o[i]=$(i).checked);LS.set('cs',o)};
+(()=>{const o=LS.get('cs',{});IDS.forEach(i=>{if(o[i]!=null)$(i).value=o[i]});CKS.forEach(i=>{if(o[i]!=null)$(i).checked=o[i]});
+ [...IDS,...CKS].forEach(i=>$(i).addEventListener('change',()=>{saveCfg();if(i==='auto'){setAuto();if($('auto').checked)scan()}}));
+ $('go').onclick=scan;$('clr').onclick=()=>{if(confirm('I-clear ang history?')){hist=[];save();render()}};
+ render();setAuto()})();
+</script></body></html>
